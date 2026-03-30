@@ -14,46 +14,71 @@ $rows = Import-Csv $CsvPath | Where-Object { $_.DisplayName -like $Filter }
 Write-Host "$($rows.Count) apps to process"
 
 foreach ($row in $rows) {
-    $existing = Get-MgServicePrincipal -Filter "appId eq '$($row.AppId)'" -EA SilentlyContinue
+    $existingSP  = Get-MgServicePrincipal -Filter "appId eq '$($row.AppId)'" -EA SilentlyContinue
+    $existingApp = Get-MgApplication -Filter "appId eq '$($row.AppId)'" -EA SilentlyContinue
 
-    if ($existing -and -not $Update) {
+    if ($existingSP -and -not $Update) {
         Write-Host "SKIP $($row.DisplayName) (exists)" -ForegroundColor DarkGray
         continue
     }
 
-    $body = @{
-        appId                      = $row.AppId
-        displayName                = $row.DisplayName
+    # homepage must be set on app reg, not SP
+    $appBody = @{
+        displayName    = $row.DisplayName
+        signInAudience = "AzureADMyOrg"
+    }
+    if ($row.Homepage)         { $appBody.web = @{ homePageUrl = $row.Homepage } }
+    if ($row.AppRolesJson)     { $appBody.appRoles = $row.AppRolesJson | ConvertFrom-Json }
+    if ($row.OAuth2ScopesJson) { $appBody.api = @{ oauth2PermissionScopes = $row.OAuth2ScopesJson | ConvertFrom-Json } }
+
+    $spBody = @{
         accountEnabled             = [bool]::Parse($row.AccountEnabled)
         appRoleAssignmentRequired  = [bool]::Parse($row.AppRoleAssignmentRequired)
         preferredSingleSignOnMode  = "saml"
-        replyUrls                  = @($row.ReplyUrls -split "\|" | Where-Object { $_ })
         tags                       = @($row.Tags -split "\|" | Where-Object { $_ })
-        servicePrincipalNames      = @($row.SPNs -split "\|" | Where-Object { $_ })
         notificationEmailAddresses = @($row.NotificationEmails -split "\|" | Where-Object { $_ })
     }
-
-    if ($row.Homepage)       { $body.homepage  = $row.Homepage }
-    if ($row.LoginUrl)       { $body.loginUrl  = $row.LoginUrl }
-    if ($row.LogoutUrl)      { $body.logoutUrl = $row.LogoutUrl }
-    if ($row.SamlRelayState) { $body.samlSingleSignOnSettings = @{ relayState = $row.SamlRelayState } }
-
-    if ($row.AppRolesJson)     { $body.appRoles               = $row.AppRolesJson | ConvertFrom-Json }
-    if ($row.OAuth2ScopesJson) { $body.oauth2PermissionScopes = $row.OAuth2ScopesJson | ConvertFrom-Json }
+    if ($row.LoginUrl)       { $spBody.loginUrl  = $row.LoginUrl }
+    if ($row.LogoutUrl)      { $spBody.logoutUrl = $row.LogoutUrl }
+    if ($row.SamlRelayState) { $spBody.samlSingleSignOnSettings = @{ relayState = $row.SamlRelayState } }
 
     if ($WhatIf) {
-        Write-Host "WHATIF: $( if ($existing) {'UPDATE'} else {'CREATE'} ) $($row.DisplayName)" -ForegroundColor Cyan
+        Write-Host "WHATIF: $( if ($existingSP) {'UPDATE'} else {'CREATE'} ) $($row.DisplayName)" -ForegroundColor Cyan
         continue
     }
 
     try {
-        if ($existing -and $Update) {
-            Update-MgServicePrincipal -ServicePrincipalId $existing.Id -BodyParameter $body
+        if ($existingSP -and $Update) {
+            Update-MgServicePrincipal -ServicePrincipalId $existingSP.Id -BodyParameter $spBody
             Write-Host "UPDATED $($row.DisplayName)" -ForegroundColor Green
-        } else {
-            $new = New-MgServicePrincipal -BodyParameter $body
-            Write-Host "CREATED $($row.DisplayName) ($($new.Id))" -ForegroundColor Green
+            continue
         }
+
+        # Create app reg if needed
+        if (-not $existingApp) {
+            $newApp = New-MgApplication -BodyParameter $appBody
+            Write-Host "CREATED app reg $($row.DisplayName) ($($newApp.Id))" -ForegroundColor Cyan
+        } else {
+            $newApp = $existingApp
+        }
+
+        # Poll for SP - Entra creates it async after app reg
+        $newSP = $null
+        $tries = 0
+        while (-not $newSP -and $tries -lt 10) {
+            Start-Sleep -Seconds 3
+            $newSP = Get-MgServicePrincipal -Filter "appId eq '$($newApp.AppId)'" -EA SilentlyContinue
+            $tries++
+        }
+
+        # If still nothing, create it explicitly
+        if (-not $newSP) {
+            $newSP = New-MgServicePrincipal -BodyParameter @{ appId = $newApp.AppId }
+        }
+
+        Update-MgServicePrincipal -ServicePrincipalId $newSP.Id -BodyParameter $spBody
+        Write-Host "CREATED SP $($row.DisplayName) ($($newSP.Id))" -ForegroundColor Green
+
     } catch {
         Write-Host "ERROR $($row.DisplayName): $($_.Exception.Message)" -ForegroundColor Red
     }
